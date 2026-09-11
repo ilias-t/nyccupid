@@ -46,6 +46,7 @@ usage() {
 Usage: cupid <command> [monitor]
 
 Commands:
+  setup                  Install dependencies and the browser, and create .env from the example
   login <monitor>        Open a visible browser window to log in to NYC.ID manually
   start <monitor>        Start the poller in the background
   stop  <monitor>|--all  Stop the background poller (--all stops every known monitor)
@@ -425,7 +426,48 @@ cmd_logs() {
 command="${1:-}"
 arg="${2:-}"
 
+# One command for the whole first-run sequence: dependencies, the browser
+# binary, and a starting .env. Deliberately a subcommand rather than an npm
+# postinstall hook — the Chromium download is ~280 MB, which should happen
+# because someone asked for it, not as a surprise side effect of `npm install`.
+cmd_setup() {
+  cd "$ROOT_DIR" || exit 1
+
+  echo "==> Installing dependencies"
+  npm install --no-audit --no-fund || { echo "npm install failed." >&2; exit 1; }
+
+  echo
+  echo "==> Installing Playwright's Chromium (~280 MB — both monitors need it)"
+  npx --yes playwright install chromium || { echo "playwright install failed." >&2; exit 1; }
+
+  echo
+  if [[ -f "$ENV_FILE" ]]; then
+    # Never clobber an existing .env — it holds live credentials.
+    echo "==> .env already exists; leaving it untouched"
+  else
+    cp "$ROOT_DIR/.env.example" "$ENV_FILE" || exit 1
+    echo "==> Created .env from .env.example"
+  fi
+
+  cat <<'NEXT'
+
+Setup complete. Next:
+
+  1. Edit .env and fill in the block for the monitor you want:
+       pickup  - an office name and two dates. No account needed.
+       virtual - NYC.ID email and password, plus four IDs you pull from
+                 DevTools once. The README walks through finding them.
+
+  2. Start it:
+       ./bin/cupid start pickup
+       ./bin/cupid login virtual && ./bin/cupid start virtual
+NEXT
+}
+
 case "$command" in
+  setup)
+    cmd_setup
+    ;;
   login)
     [[ -n "$arg" ]] || { usage; exit 1; }
     validate_monitor "$arg" || exit 1

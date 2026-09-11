@@ -19,7 +19,7 @@
     "notifications"
   ],
   "scripts": {
-    "setup": "playwright install chromium",
+    "setup": "./bin/cupid setup",
     "login": "node src/poller.js login",
     "start": "node src/poller.js run"
   },
