@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Secrets — real credentials live in .env, which must never be committed.
+# .env.* covers variants (.env.local, .env.production, ...); the negation
+# below keeps the committed template tracked.
+.env
+.env.*
+!.env.example
+
+# Runtime state written by the poller
+state-*.json
+state-*.json.tmp
+.cupid-*.pid
+
+# Logs (poller, run wrappers, launchd, notify)
+logs/
+npm-debug.log*
+yarn-error.log*
+
+# Persistent Playwright browser profiles (contain live login sessions)
+.pw-user-data-*/
+
+# Local tooling / editor scratch
+.playwright-mcp/
+.claude
+.mcp.json
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

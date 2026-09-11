@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>nyccupid.pickup</string>
+
+  <!--
+    This file is a template. Replace both placeholder tokens before loading it:
+
+      __NODE_PATH__     absolute path to your node binary (`command -v node`)
+      __PROJECT_DIR__   absolute path to your clone of this repository
+
+    The README has a one-line sed recipe that fills in both and writes the
+    result straight to ~/Library/LaunchAgents/nyccupid.pickup.plist.
+  -->
+
+  <!--
+    See nyccupid.virtual.plist.example for why ProgramArguments[0] must be an
+    absolute node path, and why the trailing "pickup" argument matters for
+    bin/cupid's process tracking, not just logging.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_PATH__</string>
+    <string>src/poller.js</string>
+    <string>run</string>
+    <string>pickup</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_DIR__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT_DIR__/logs/launchd-pickup.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_DIR__/logs/launchd-pickup.err.log</string>
+</dict>
+</plist>

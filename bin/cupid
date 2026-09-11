@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+ENV_FILE="$ROOT_DIR/.env"
+
+# Reads one value out of .env the way dotenv does, rather than a bare
+# `grep "^KEY="`. dotenv tolerates an `export ` prefix, whitespace around the
+# `=`, and quoted values; a naive grep+sed either misses those lines entirely
+# or hands back a value with the quotes still attached. That matters here
+# because the only consumer is the staleness threshold in `status` — a
+# POLL_INTERVAL_SECONDS of "600" that parses as NaN falls back to 75 and makes
+# `status` report a perfectly healthy poller as "may be stuck".
+read_env_var() {
+  local key="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*(.*)\$/\2/p" "$ENV_FILE" 2>/dev/null \
+    | head -n1 \
+    | sed -E "s/[[:space:]]+\$//; s/^\"(.*)\"\$/\1/; s/^'(.*)'\$/\1/"
+}
+LOG_DIR="$ROOT_DIR/logs"
+
+# Known monitor names and whether each one uses a persistent, logged-in
+# browser session. This list is hand-mirrored in src/monitors/index.js
+# (MONITOR_NAMES) — a new monitor always needs matching strategy code there
+# too, so keeping this a plain array here (rather than deriving it from .env
+# or a shared config file) doesn't add real drift risk beyond what already
+# exists, and keeps this fast-fail gate dependency-free.
+KNOWN_MONITORS=(virtual pickup)
+
+# Associative arrays need bash 4+; macOS ships bash 3.2 by default, so this
+# is a plain function instead — echoes 1/0 rather than returning a shell
+# status code, since callers use the result as a string comparison.
+requires_session() {
+  case "$1" in
+    virtual) echo 1 ;;
+    pickup) echo 0 ;;
+    *) echo 0 ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+Usage: cupid <command> [monitor]
+
+Commands:
+  login <monitor>        Open a visible browser window to log in to NYC.ID manually
+  start <monitor>        Start the poller in the background
+  stop  <monitor>|--all  Stop the background poller (--all stops every known monitor)
+  status [monitor]       Show status for one monitor, or a one-line summary of all if omitted
+  logs  <monitor>        Follow the poller log for one monitor (tail -f; Ctrl-C only stops watching)
+
+Monitors: virtual, pickup
+EOF
+}
+
+validate_monitor() {
+  local m="$1"
+  for known in "${KNOWN_MONITORS[@]}"; do
+    if [[ "$m" == "$known" ]]; then return 0; fi
+  done
+  echo "unknown monitor '$m' — known monitors: ${KNOWN_MONITORS[*]}" >&2
+  return 1
+}
+
+# Computes every per-monitor path from the monitor name and sets them as
+# globals for the rest of the script to use — called first thing by every
+# monitor-scoped cmd_* function. Naming (dash-suffixed) matches what
+# src/poller.js itself derives, so `status`/`logs` read the exact files the
+# poller actually writes.
+set_monitor_paths() {
+  MONITOR="$1"
+  PID_FILE="$ROOT_DIR/.cupid-$MONITOR.pid"
+  STATE_FILE="$ROOT_DIR/state-$MONITOR.json"
+  POLLER_LOG="$LOG_DIR/poller-$MONITOR.log"
+  RUN_OUT_LOG="$LOG_DIR/run-$MONITOR.out.log"
+  RUN_ERR_LOG="$LOG_DIR/run-$MONITOR.err.log"
+  SESSION_DIR="$ROOT_DIR/.pw-user-data-$MONITOR"
+  # Trailing anchor matters, not just the monitor name substituted in — a
+  # bare "$MONITOR" pattern would still substring-match a future monitor name
+  # that happens to prefix another (e.g. a later "virtual2").
+  POLLER_PATTERN="src/poller\\.js run $MONITOR\$"
+}
+
+is_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+cmd_login() {
+  local monitor="$1"
+  set_monitor_paths "$monitor"
+
+  if [[ "$(requires_session "$monitor")" == "0" ]]; then
+    echo "$monitor: no login step — this monitor doesn't use a persistent browser session."
+    echo "run './bin/cupid start $monitor' directly."
+    return 1
+  fi
+
+  # login and run both open the same $SESSION_DIR Chromium profile —
+  # Playwright holds an exclusive lock on it, so a second launch while one is
+  # open fails. Stop this monitor's background poller first if it's running,
+  # and offer to restart it after. is_running() alone would miss an untracked
+  # poller (see cmd_start/cmd_stop) and walk straight into launchContext()'s
+  # exclusive lock on $SESSION_DIR — which fails before runLogin()'s own
+  # try/catch even starts, surfacing as a raw Playwright stack trace instead
+  # of a clear "already running" message.
+  #
+  # This must only ever affect $monitor, never any other monitor's running
+  # poller — that guarantee is what set_monitor_paths above (and the
+  # anchored POLLER_PATTERN it computes) exists to provide.
+  local was_running=0
+  if is_running || [[ -n "$(pgrep -f "$POLLER_PATTERN" 2>/dev/null || true)" ]]; then
+    was_running=1
+    echo "$monitor: poller is running — stopping it first so login can use the browser profile..."
+    cmd_stop "$monitor"
+  fi
+
+  # Under `set -e`, a plain `node ... login; local status=$?` would abort this
+  # whole script the instant login exits non-zero (including Ctrl-C, which
+  # poller.js turns into exit 130) — status=$? would never run, so if the
+  # poller was stopped above it would silently stay stopped with no message
+  # telling the user why or that they need to restart it themselves.
+  local status=0
+  node src/poller.js login "$monitor" || status=$?
+
+  if [[ $status -ne 0 ]]; then
+    echo "$monitor: login did not finish successfully (exit $status)."
+    if [[ $was_running -eq 1 ]]; then
+      echo "the $monitor poller was stopped to free up the browser profile and has NOT been restarted — run './bin/cupid start $monitor' once you're ready."
+    fi
+    return $status
+  fi
+
+  if [[ $was_running -eq 1 ]]; then
+    echo "$monitor: login finished — restarting the poller..."
+    cmd_start "$monitor"
+  fi
+
+  return 0
+}
+
+cmd_start() {
+  local monitor="$1"
+  set_monitor_paths "$monitor"
+  mkdir -p "$LOG_DIR"
+
+  if is_running; then
+    echo "$monitor: already running (pid $(cat "$PID_FILE"))"
+    return 0
+  fi
+
+  if [[ "$(requires_session "$monitor")" == "1" ]] && [[ ! -d "$SESSION_DIR" ]]; then
+    echo "$monitor: no saved login session found ($SESSION_DIR doesn't exist)."
+    echo "run './bin/cupid login $monitor' first, then start the poller."
+    return 1
+  fi
+
+  # is_running() only trusts the pidfile — a poller started outside bin/cupid
+  # (npm start, launchd, or a previous run whose recorded pid was the wrong
+  # one — see below) can be running with nothing in the pidfile pointing at
+  # it. Refuse rather than silently launching a second instance against the
+  # same browser profile/session.
+  local existing
+  existing="$(pgrep -f "$POLLER_PATTERN" 2>/dev/null || true)"
+  if [[ -n "$existing" ]]; then
+    echo "$monitor: a poller process is already running but isn't tracked by the pidfile (pid(s): $(echo "$existing" | xargs))."
+    echo "run './bin/cupid stop $monitor' to clean it up, then start again."
+    return 1
+  fi
+
+  rm -f "$PID_FILE"
+  touch "$RUN_ERR_LOG"
+  local err_lines_before
+  err_lines_before="$(wc -l < "$RUN_ERR_LOG" | tr -d ' ')"
+
+  nohup node src/poller.js run "$monitor" >> "$RUN_OUT_LOG" 2>> "$RUN_ERR_LOG" &
+  local bg_pid=$!
+  disown 2>/dev/null || true
+
+  # Some Node version managers (Volta, asdf, and other shim-based setups)
+  # resolve `node` through a shim that forks the real interpreter as a *child*
+  # process rather than exec'ing into it — so $! can be the shim's pid, not
+  # the poller's, depending on how node was installed. Killing the shim
+  # later would leave the real process running, orphaned, with nothing in
+  # the pidfile pointing at it (confirmed by hand: SIGTERM to the shim pid
+  # kills only the shim). Resolve the real pid via its process-list child;
+  # fall back to $! itself when node isn't shimmed and has no child.
+  local real_pid=""
+  local checks=0
+  while [[ $checks -lt 10 ]]; do
+    local child
+    child="$(pgrep -P "$bg_pid" 2>/dev/null | head -n1 || true)"
+    [[ -n "$child" ]] && real_pid="$child"
+    sleep 0.2
+    checks=$((checks + 1))
+  done
+  [[ -n "$real_pid" ]] || real_pid="$bg_pid"
+
+  if ! kill -0 "$real_pid" 2>/dev/null; then
+    echo "$monitor: poller exited immediately — it did not start."
+    echo "recent stderr ($RUN_ERR_LOG):"
+    tail -n +"$((err_lines_before + 1))" "$RUN_ERR_LOG" | sed 's/^/  /'
+    return 1
+  fi
+
+  echo "$real_pid" > "$PID_FILE"
+  echo "$monitor: started poller (pid $real_pid)"
+  echo "stdout log: $RUN_OUT_LOG"
+  echo "stderr log: $RUN_ERR_LOG"
+  echo "poller log: $POLLER_LOG"
+}
+
+cmd_stop() {
+  local monitor="$1"
+  set_monitor_paths "$monitor"
+
+  if [[ ! -f "$PID_FILE" ]]; then
+    echo "$monitor: not running (no pidfile)"
+  else
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+      echo "$monitor: not running (stale pidfile, removing it)"
+      rm -f "$PID_FILE"
+    else
+      echo "$monitor: stopping pid $pid (SIGTERM)..."
+      kill -TERM "$pid" 2>/dev/null || true
+      local waited=0
+      while [[ $waited -lt 5 ]]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "$monitor: still alive after ${waited}s, sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+      rm -f "$PID_FILE"
+      echo "$monitor: stopped"
+    fi
+  fi
+
+  # Belt-and-suspenders: a poller whose recorded pid was a version-manager
+  # shim rather than the real process (older pidfile, or some other
+  # mismatch), or one started outside bin/cupid entirely, can be running with
+  # nothing in the pidfile pointing at it — the block above would then call
+  # this "stopped" while it keeps polling in the background. Sweep for it by
+  # matching the process list too — scoped to THIS monitor only via the
+  # anchored $POLLER_PATTERN, so this can never catch a different monitor's
+  # process (this will still also stop a launchd-managed instance of this
+  # same monitor if one happens to be running — the two modes are meant to
+  # be used one at a time, per the README).
+  local leftover
+  leftover="$(pgrep -f "$POLLER_PATTERN" 2>/dev/null || true)"
+  if [[ -n "$leftover" ]]; then
+    echo "$monitor: found untracked poller process(es) still running (pid(s): $(echo "$leftover" | xargs)) — stopping those too."
+    kill -TERM $leftover 2>/dev/null || true
+    sleep 1
+    kill -KILL $leftover 2>/dev/null || true
+  fi
+}
+
+cmd_stop_all() {
+  local any_failed=0
+  for m in "${KNOWN_MONITORS[@]}"; do
+    cmd_stop "$m" || any_failed=1
+  done
+  return $any_failed
+}
+
+# One monitor's full status detail (today's original single-monitor output).
+# BRIEF=1 (set by the caller for the no-argument "all monitors" view) instead
+# prints just the one-line summary, since the full block per monitor would be
+# unusable to scan across several monitors at once.
+cmd_status_one() {
+  local monitor="$1"
+  local brief="${2:-0}"
+  set_monitor_paths "$monitor"
+
+  local running=0
+  if is_running; then
+    running=1
+    [[ "$brief" == "0" ]] && echo "$monitor poller: running (pid $(cat "$PID_FILE"))"
+  else
+    if [[ "$brief" == "0" ]]; then
+      echo "$monitor poller: not running"
+      if [[ -f "$PID_FILE" ]]; then
+        echo "(stale pidfile at $PID_FILE — a previous run may have died without cleaning up; './bin/cupid start $monitor' will clean this up automatically)"
+      fi
+    fi
+    # is_running() only trusts the pidfile — without this, an untracked
+    # poller (see cmd_start/cmd_stop) would report "not running" here while
+    # it keeps polling in the background, which defeats the entire point of
+    # asking "is it actually working?".
+    local untracked
+    untracked="$(pgrep -f "$POLLER_PATTERN" 2>/dev/null || true)"
+    if [[ -n "$untracked" ]]; then
+      [[ "$brief" == "0" ]] && echo "($monitor: a poller process IS running but isn't tracked by the pidfile — pid(s): $(echo "$untracked" | xargs). Run './bin/cupid stop $monitor' to clean it up.)"
+      running=1
+    fi
+  fi
+
+  if [[ "$brief" == "0" ]] && [[ "$(requires_session "$monitor")" == "1" ]] && [[ ! -d "$SESSION_DIR" ]]; then
+    echo "(no saved login session either — run './bin/cupid login $monitor' before starting)"
+  fi
+
+  if [[ ! -f "$STATE_FILE" ]]; then
+    echo "$monitor: state file not found yet (poller hasn't completed a check, or hasn't started)"
+    return 0
+  fi
+
+  # Per-monitor poll-interval override, falling back to the global default —
+  # prefix-first-then-fallback so a monitor without its own override still
+  # gets a sane staleness threshold instead of silently using 0.
+  local prefix
+  prefix="CUPID_$(printf '%s' "$monitor" | tr '[:lower:]' '[:upper:]')_POLL_INTERVAL_SECONDS"
+  local poll_interval
+  poll_interval="$(read_env_var "$prefix")"
+  if [[ -z "$poll_interval" ]]; then
+    poll_interval="$(read_env_var POLL_INTERVAL_SECONDS)"
+  fi
+  [[ -n "$poll_interval" ]] || poll_interval=75
+
+  STATE_FILE="$STATE_FILE" POLL_INTERVAL_SECONDS="$poll_interval" IS_RUNNING="$running" MONITOR_LABEL="$monitor" BRIEF="$brief" node -e '
+    const fs = require("fs");
+    const statePath = process.env.STATE_FILE;
+    const interval = Number(process.env.POLL_INTERVAL_SECONDS) || 75;
+    const isRunning = process.env.IS_RUNNING === "1";
+    const label = process.env.MONITOR_LABEL;
+    const brief = process.env.BRIEF === "1";
+    let state;
+    try {
+      state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    } catch (err) {
+      console.log(label + ": state file unreadable/invalid (" + err.message + ")");
+      process.exit(0);
+    }
+    const { lastCheckAt, status, foundDates, lastError, checksCompleted } = state;
+
+    let ageSec = null;
+    if (lastCheckAt) {
+      const ageMs = Date.now() - Date.parse(lastCheckAt);
+      if (!Number.isNaN(ageMs)) ageSec = Math.max(0, Math.floor(ageMs / 1000));
+    }
+    const fmtAge = (sec) => {
+      if (sec == null) return "unknown";
+      if (sec < 90) return sec + "s ago";
+      return Math.floor(sec / 60) + "m ago";
+    };
+    const stale = ageSec != null && ageSec > interval * 5;
+
+    // `found` always wins the headline, regardless of whether the poller is
+    // still running or the check is stale — it is the one outcome this tool
+    // exists to surface, and burying it under a staleness/not-running
+    // warning would defeat the point.
+    let summary;
+    if (status === "found") {
+      const list = Array.isArray(foundDates) ? foundDates.join(", ") : "(unknown dates)";
+      summary = "🚨 FOUND: " + list + " — go book now!";
+      if (!isRunning) summary += " (poller is not currently running)";
+      else if (stale) summary += " (last check was " + fmtAge(ageSec) + ")";
+    } else if (!isRunning) {
+      summary = "⚠️  not running" + (lastCheckAt ? " — last check was " + fmtAge(ageSec) + " (status: " + status + ")" : " — never started");
+    } else if (status === "auth_error") {
+      summary = "🚨 was not authenticated on last check — poller retries login automatically; run `./bin/cupid logs " + label + "` if this persists";
+    } else if (status === "config_error") {
+      summary = "🚨 request/config failing (not an auth problem — retrying login will not fix this): " + (lastError || "unknown");
+    } else if (stale) {
+      summary = "⚠️  running, but last check was " + fmtAge(ageSec) + " — may be stuck (poll interval is " + interval + "s)";
+    } else if (status === "error") {
+      summary = "⚠️  poller hit an error: " + (lastError || "unknown");
+    } else if (status === "no_slots") {
+      summary = "✅ running, checked " + fmtAge(ageSec) + ", no openings yet";
+    } else {
+      summary = "running, no checks completed yet";
+    }
+    console.log(label + ": " + summary);
+    if (brief) process.exit(0);
+    console.log("");
+
+    console.log("lastCheckAt: " + (lastCheckAt != null ? lastCheckAt + " (" + fmtAge(ageSec) + ")" : "(none)"));
+    console.log("status: " + (status != null ? status : "(none)"));
+    console.log("foundDates: " + (Array.isArray(foundDates) ? JSON.stringify(foundDates) : "(none)"));
+    if (lastError) console.log("lastError: " + lastError);
+    console.log("checksCompleted: " + (Number.isFinite(checksCompleted) ? checksCompleted : 0));
+    if (stale) {
+      console.log("WARNING: lastCheckAt is over 5x the poll interval (" + interval + "s) old — the loop may have died silently.");
+    }
+  '
+}
+
+cmd_status() {
+  local monitor="${1:-}"
+  if [[ -n "$monitor" ]]; then
+    validate_monitor "$monitor" || return 1
+    cmd_status_one "$monitor" 0
+    return 0
+  fi
+  # No argument: brief, one-line-per-monitor summary across all known
+  # monitors. Each call is guarded with `|| true` — under `set -e`, one
+  # monitor's non-zero exit (e.g. an unreadable state file) would otherwise
+  # abort the loop and silently skip every monitor after it.
+  for m in "${KNOWN_MONITORS[@]}"; do
+    cmd_status_one "$m" 1 || true
+  done
+}
+
+cmd_logs() {
+  local monitor="$1"
+  set_monitor_paths "$monitor"
+  mkdir -p "$LOG_DIR"
+  touch "$POLLER_LOG"
+  echo "Following $POLLER_LOG for $monitor (Ctrl-C stops watching, does not stop the poller)"
+  tail -n 50 -f "$POLLER_LOG"
+}
+
+command="${1:-}"
+arg="${2:-}"
+
+case "$command" in
+  login)
+    [[ -n "$arg" ]] || { usage; exit 1; }
+    validate_monitor "$arg" || exit 1
+    cmd_login "$arg"
+    ;;
+  start)
+    [[ -n "$arg" ]] || { usage; exit 1; }
+    validate_monitor "$arg" || exit 1
+    cmd_start "$arg"
+    ;;
+  stop)
+    if [[ "$arg" == "--all" ]]; then
+      cmd_stop_all
+    else
+      [[ -n "$arg" ]] || { usage; exit 1; }
+      validate_monitor "$arg" || exit 1
+      cmd_stop "$arg"
+    fi
+    ;;
+  status)
+    if [[ -n "$arg" ]]; then
+      validate_monitor "$arg" || exit 1
+    fi
+    cmd_status "$arg"
+    ;;
+  logs)
+    [[ -n "$arg" ]] || { usage; exit 1; }
+    validate_monitor "$arg" || exit 1
+    cmd_logs "$arg"
+    ;;
+  *) usage; exit 1 ;;
+esac

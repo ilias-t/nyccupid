@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>nyccupid.virtual</string>
+
+  <!--
+    This file is a template. Replace both placeholder tokens before loading it:
+
+      __NODE_PATH__     absolute path to your node binary (`command -v node`)
+      __PROJECT_DIR__   absolute path to your clone of this repository
+
+    The README has a one-line sed recipe that fills in both and writes the
+    result straight to ~/Library/LaunchAgents/nyccupid.virtual.plist.
+  -->
+
+  <!--
+    ProgramArguments[0] must be the absolute path to node. launchd runs with a
+    minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so a bare "node" will not
+    resolve if it comes from Homebrew, nvm, or Volta — which is where node
+    comes from on most development machines. Find the right path with
+    `command -v node`, and update this if node is ever reinstalled or moved to
+    a different version manager/location.
+
+    The trailing "virtual" argument matters, not just for identifying this
+    job in logs — bin/cupid's stop/start/status commands find a running
+    poller by matching "src/poller.js run <monitor>" in the process list, so
+    a launchd-run instance only gets tracked correctly if its own argv ends
+    in the monitor name too.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_PATH__</string>
+    <string>src/poller.js</string>
+    <string>run</string>
+    <string>virtual</string>
+  </array>
+
+  <!-- Runs `node src/poller.js run virtual` directly, not `bin/cupid start
+       virtual`: bin/cupid start backgrounds the process and exits
+       immediately, which would make launchd think the job died and restart
+       it in a loop. -->
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_DIR__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT_DIR__/logs/launchd-virtual.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_DIR__/logs/launchd-virtual.err.log</string>
+</dict>
+</plist>

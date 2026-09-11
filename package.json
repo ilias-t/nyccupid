@@ -1,0 +1,30 @@
+{
+  "name": "nyccupid-watcher",
+  "version": "0.1.0",
+  "description": "Local watcher for NYC marriage-license virtual-appointment and in-person pickup availability",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "nyc",
+    "marriage-license",
+    "city-clerk",
+    "appointment",
+    "availability",
+    "monitor",
+    "poller",
+    "playwright",
+    "notifications"
+  ],
+  "scripts": {
+    "setup": "playwright install chromium",
+    "login": "node src/poller.js login",
+    "start": "node src/poller.js run"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "playwright": "^1.63.0"
+  }
+}
