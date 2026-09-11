@@ -6,14 +6,12 @@ CLA, no style bot, and no review SLA.
 ## Running it locally
 
 ```
-npm install
-npx playwright install chromium
-cp .env.example .env
+./bin/cupid setup
 ```
 
-You need Node 20+, and the `playwright install` step is mandatory — `npm
-install` doesn't fetch the browser binary. Both monitors need it, including
-`pickup`. See the README's Requirements section for why.
+Installs dependencies, fetches Playwright's Chromium (~280 MB — both monitors
+need it, `pickup` included), and creates `.env` from the example without
+overwriting an existing one. Needs Node 20+.
 
 `.npmrc` sets `engine-strict=true`, so an unsupported Node version fails the
 install outright instead of printing a warning you scroll past. One thing to
